@@ -1,0 +1,9 @@
+# Ignore every directory
+/*/
+
+# Specifically ignore the standard build/dependency folders 
+# (just in case they are nested or differently structured)
+node_modules/
+out/
+dist/
+.vscode-test/
