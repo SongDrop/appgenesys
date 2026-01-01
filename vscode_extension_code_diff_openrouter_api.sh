@@ -128,6 +128,16 @@ cat << 'EOL' > package.json
         "category": "AI Assistant"
       },
       {
+        "command": "openrouter.applyGitPatch",
+        "title": "Apply Git Patch",
+        "category": "AI Assistant"
+      },
+      {
+        "command": "openrouter.openPatchFolder", 
+        "title": "Open Patches Folder",
+        "category": "AI Assistant"
+      },
+      {
         "command": "diffApp.validateDiff",
         "title": "Validate Diff Syntax",
         "category": "AI Assistant"
@@ -307,8 +317,12 @@ EOL
 cat << 'EOL' > src/diff_application.ts
 /**
  * UNIFIED DIFF APPLICATION SYSTEM
- * Enhanced version with AI integration
+ * Simple Git-Compatible Patch System
  */
+
+import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export interface Comment {
     id: number;
@@ -318,8 +332,10 @@ export interface Comment {
     message: string;
     diff?: string;
     status?: 'pending' | 'applied' | 'rejected';
-    model?: string;  // Which AI model generated this
-    context?: string; // Code context when suggestion was made
+    model?: string;
+    context?: string;
+    patchFile?: string;
+    gitCommand?: string;
 }
 
 export interface DiffResult {
@@ -329,7 +345,7 @@ export interface DiffResult {
     errors: string[];
     newContent: string;
     warnings: string[];
-    diffApplied?: string; // The diff that was applied
+    diffApplied?: string;
 }
 
 export interface AISuggestion {
@@ -341,6 +357,16 @@ export interface AISuggestion {
     explanation: string;
     filePath: string;
     applied: boolean;
+    patchFile?: string;
+    gitCommand?: string;
+}
+
+export interface PatchSaveResult {
+    success: boolean;
+    patchPath: string;
+    gitCommand: string;
+    diff: string;
+    warnings: string[];
 }
 
 export class DiffApplicationSystem {
@@ -386,7 +412,6 @@ export class DiffApplicationSystem {
                         inHunk = true;
                         originalIndex = hunkStartOriginal;
                         
-                        // Ensure we're at the right position in original
                         while (newLines.length < hunkStartNew) {
                             newLines.push(originalLines[newLines.length] || '');
                         }
@@ -394,28 +419,22 @@ export class DiffApplicationSystem {
                     }
                 }
                 
-                if (!inHunk) {
-                    continue;
-                }
+                if (!inHunk) continue;
                 
-                // Process hunk lines
                 if (line.startsWith(' ')) {
-                    // Context line - keep original
                     if (originalIndex < originalLines.length && 
                         originalLines[originalIndex] === line.substring(1)) {
                         newLines.push(originalLines[originalIndex]);
                         originalIndex++;
                         lineNumber++;
                     } else {
-                        result.warnings.push(`Context mismatch at line ${lineNumber}, but continuing`);
-                        // Try to recover by adding the context line anyway
+                        result.warnings.push(`Context mismatch at line ${lineNumber}`);
                         newLines.push(line.substring(1));
                         originalIndex++;
                         lineNumber++;
                     }
                 } 
                 else if (line.startsWith('+')) {
-                    // Added line - insert new
                     const addedLine = line.substring(1);
                     newLines.push(addedLine);
                     result.appliedLines.push(lineNumber);
@@ -423,14 +442,13 @@ export class DiffApplicationSystem {
                     lineNumber++;
                 } 
                 else if (line.startsWith('-')) {
-                    // Removed line - skip original
                     if (originalIndex < originalLines.length && 
                         originalLines[originalIndex] === line.substring(1)) {
                         result.appliedLines.push(originalIndex + 1);
                         result.totalChanges++;
                         originalIndex++;
                     } else {
-                        result.warnings.push(`Deletion mismatch at original line ${originalIndex + 1}, skipping`);
+                        result.warnings.push(`Deletion mismatch at line ${originalIndex + 1}`);
                         originalIndex++;
                     }
                 } 
@@ -438,7 +456,6 @@ export class DiffApplicationSystem {
                     continue;
                 }
                 
-                // Check if we've processed all hunk lines
                 const linesProcessedInHunk = newLines.length - hunkStartNew;
                 const deletionsProcessed = result.appliedLines.filter(l => 
                     l > hunkStartOriginal && l <= hunkStartOriginal + hunkLinesOriginal
@@ -450,7 +467,6 @@ export class DiffApplicationSystem {
                 }
             }
             
-            // Add any remaining original lines
             while (originalIndex < originalLines.length) {
                 newLines.push(originalLines[originalIndex]);
                 originalIndex++;
@@ -465,9 +481,116 @@ export class DiffApplicationSystem {
         
         return result;
     }
+
+    /**
+    * Get saved patches from workspace
+    */
+    public getSavedPatches(): Array<{
+        relativePath: string;
+        explanation: string;
+        timestamp: string;
+        patchFile: string;
+    }> {
+        try {
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                return [];
+            }
+            
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            const allFiles = fs.readdirSync(workspaceRoot);
+            const diffFiles = allFiles.filter(file => file.endsWith('.diff'));
+            
+            return diffFiles.map(file => {
+                const filePath = path.join(workspaceRoot, file);
+                const stats = fs.statSync(filePath);
+                
+                // Try to extract explanation from first lines of the file
+                let explanation = file.replace('.diff', '').split('.').pop() || 'AI Patch';
+                try {
+                    const content = fs.readFileSync(filePath, 'utf-8');
+                    const lines = content.split('\n');
+                    for (const line of lines) {
+                        if (line.includes('# Explanation:')) {
+                            explanation = line.replace('# Explanation:', '').trim();
+                            break;
+                        }
+                    }
+                } catch (e) {
+                    // Use default explanation
+                }
+                
+                return {
+                    relativePath: file,
+                    explanation: explanation,
+                    timestamp: stats.mtime.toISOString(),
+                    patchFile: filePath
+                };
+            });
+        } catch (error) {
+            console.error('Error getting saved patches:', error);
+            return [];
+        }
+    }
+
+    /**
+    * Apply patch from file
+    */
+    public async applyPatchFromFile(patchPath: string): Promise<{ success: boolean; output: string; error: string }> {
+        return new Promise((resolve) => {
+            const { exec } = require('child_process');
+            
+            exec(`git apply --3way "${patchPath}"`, (error: any, stdout: string, stderr: string) => {
+                if (error) {
+                    resolve({
+                        success: false,
+                        output: stdout,
+                        error: stderr || error.message
+                    });
+                } else {
+                    resolve({
+                        success: true,
+                        output: stdout,
+                        error: ''
+                    });
+                }
+            });
+        });
+    }
+
+    /**
+    * Extract and fix diff from AI response with proper file paths
+    */
+    public extractAndFixDiffFromAIResponse(aiResponse: string, originalFilePath: string): {
+        diff: string;
+        explanation: string;
+        isValid: boolean;
+    } {
+        const extracted = this.extractDiffFromAIResponse(aiResponse);
+        
+        if (!extracted.diff) {
+            return {
+                diff: '',
+                explanation: extracted.explanation,
+                isValid: false
+            };
+        }
+        
+        // Fix the diff headers to use the actual filename
+        const fileName = path.basename(originalFilePath);
+        const fixedDiff = this.makeGitCompatible(extracted.diff, fileName);
+        
+        const validation = this.validateDiff(fixedDiff);
+        
+        return {
+            diff: fixedDiff,
+            explanation: extracted.explanation,
+            isValid: validation.isValid
+        };
+    }
     
     /**
-     * Generate a unified diff between two code versions
+     * Generate a simple unified diff between two versions
      */
     public generateUnifiedDiff(original: string, modified: string, fileName: string = 'file'): string {
         const originalLines = original.split('\n');
@@ -477,7 +600,6 @@ export class DiffApplicationSystem {
         diffLines.push(`--- a/${fileName}`);
         diffLines.push(`+++ b/${fileName}`);
         
-        // Simple diff implementation (for production, use a proper diff library)
         let i = 0, j = 0;
         while (i < originalLines.length || j < modifiedLines.length) {
             if (i < originalLines.length && j < modifiedLines.length && 
@@ -521,7 +643,6 @@ export class DiffApplicationSystem {
             const line = lines[i];
             lineCount++;
             
-            // Check for valid diff lines
             if (line.startsWith('@@')) {
                 const hunkMatch = line.match(/@@ -(\d+),(\d+) \+(\d+),(\d+) @@/);
                 if (!hunkMatch) {
@@ -531,11 +652,8 @@ export class DiffApplicationSystem {
                     inHunk = true;
                     hunkCount++;
                     
-                    // Validate hunk numbers
                     const oldStart = parseInt(hunkMatch[1]);
-                    const oldLines = parseInt(hunkMatch[2]);
                     const newStart = parseInt(hunkMatch[3]);
-                    const newLines = parseInt(hunkMatch[4]);
                     
                     if (oldStart <= 0 || newStart <= 0) {
                         warnings.push(`Hunk ${hunkCount} has questionable start positions`);
@@ -557,7 +675,7 @@ export class DiffApplicationSystem {
         }
         
         if (hunkCount > 10) {
-            warnings.push(`Large diff with ${hunkCount} hunks - consider breaking into smaller changes`);
+            warnings.push(`Large diff with ${hunkCount} hunks`);
         }
         
         return {
@@ -568,10 +686,9 @@ export class DiffApplicationSystem {
     }
     
     /**
-     * Extract diff from AI response text (ENHANCED VERSION)
+     * Extract diff from AI response text
      */
     public extractDiffFromAIResponse(aiResponse: string): { diff: string; explanation: string } {
-        // Look for diff blocks with better parsing
         const diffPatterns = [
             /```(?:diff)?\s*\n([\s\S]*?)\n```/,  // Markdown diff block
             /@@ -[\d,]+ \+[\d,]+ @@[\s\S]*?(?=\n\n|\n$|$)/,  // Raw diff
@@ -582,10 +699,8 @@ export class DiffApplicationSystem {
             const match = aiResponse.match(pattern);
             if (match) {
                 const diff = match[1] || match[0];
-                // Extract explanation (everything before diff)
                 const explanation = aiResponse.substring(0, match.index).trim();
                 
-                // Clean up the diff
                 const cleanedDiff = this.cleanDiff(diff);
                 
                 return {
@@ -595,7 +710,6 @@ export class DiffApplicationSystem {
             }
         }
         
-        // Try to find code blocks that might contain diffs
         const codeBlocks = aiResponse.match(/```[\s\S]*?```/g);
         if (codeBlocks) {
             for (const block of codeBlocks) {
@@ -613,19 +727,14 @@ export class DiffApplicationSystem {
     }
     
     /**
-     * Clean up a diff (remove markdown, extra whitespace, etc.)
+     * Clean up a diff
      */
     private cleanDiff(diff: string): string {
         let cleaned = diff.trim();
-        
-        // Remove markdown code fences if present
         cleaned = cleaned.replace(/^```(?:diff)?\s*/g, '');
         cleaned = cleaned.replace(/```$/g, '');
-        
-        // Ensure proper line endings
         cleaned = cleaned.replace(/\r\n/g, '\n');
         
-        // Remove trailing whitespace from each line
         const lines = cleaned.split('\n');
         const cleanedLines = lines.map(line => line.trimEnd());
         
@@ -650,14 +759,12 @@ export class DiffApplicationSystem {
             
             let comments: Comment[] = [];
             
-            // Load existing comments if file exists
             if (fs.existsSync(helpFilePath)) {
                 const content = fs.readFileSync(helpFilePath, 'utf-8');
                 const data = JSON.parse(content);
                 comments = data.comments || [];
             }
             
-            // Create new AI suggestion comment
             const newComment: Comment = {
                 id: comments.length > 0 ? Math.max(...comments.map(c => c.id)) + 1 : 1,
                 username: 'AI Assistant',
@@ -672,7 +779,6 @@ export class DiffApplicationSystem {
             
             comments.push(newComment);
             
-            // Save back to file
             fs.writeFileSync(
                 helpFilePath,
                 JSON.stringify({ comments }, null, 2),
@@ -713,7 +819,162 @@ export class DiffApplicationSystem {
     }
     
     /**
-     * Set last AI suggestion (for quick apply)
+     * Save diff as Git-compatible patch in current directory
+     */
+    public saveAsGitPatch(
+        diff: string,
+        originalFilePath: string,
+        patchName: string,
+        model: string = 'unknown',
+        query: string = '',
+        explanation: string = ''
+    ): PatchSaveResult {
+        try {
+            // Get current workspace directory
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                return {
+                    success: false,
+                    patchPath: '',
+                    gitCommand: '',
+                    diff: diff,
+                    warnings: ['No workspace folder found']
+                };
+            }
+            
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            
+            // Get original filename
+            const originalFileName = path.basename(originalFilePath);
+            const originalNameNoExt = path.basename(originalFilePath, path.extname(originalFilePath));
+            
+            // Create safe patch name
+            const safePatchName = patchName
+                .replace(/[^a-zA-Z0-9_\-.]/g, '-')
+                .toLowerCase()
+                .substring(0, 50);
+            
+            // Generate patch filename: originalfile.featurename.diff
+            const patchFileName = `${originalNameNoExt}.${safePatchName}.diff`;
+            const patchPath = path.join(workspaceRoot, patchFileName);
+            
+            // Ensure diff has proper Git headers
+            const gitCompatibleDiff = this.makeGitCompatible(diff, originalFileName);
+            
+            // Create metadata header
+            const metadata = `# Git-Compatible Patch
+# Generated: ${new Date().toISOString()}
+# Original file: ${originalFileName}
+# Model: ${model}
+# Query: ${query.substring(0, 100)}${query.length > 100 ? '...' : ''}
+# Explanation: ${explanation}
+# 
+# Apply with: git apply "${patchFileName}"
+# Or: patch -p1 < "${patchFileName}"
+#
+`;
+
+            // Write patch file
+            const fullContent = metadata + '\n' + gitCompatibleDiff;
+            fs.writeFileSync(patchPath, fullContent, 'utf-8');
+            
+            // Generate git command
+            const gitCommand = `git apply "${patchFileName}"`;
+            
+            return {
+                success: true,
+                patchPath: patchPath,
+                gitCommand: gitCommand,
+                diff: gitCompatibleDiff,
+                warnings: []
+            };
+            
+        } catch (error: any) {
+            return {
+                success: false,
+                patchPath: '',
+                gitCommand: '',
+                diff: diff,
+                warnings: [`Failed to save patch: ${error.message}`]
+            };
+        }
+    }
+    
+    /**
+     * Make diff Git-compatible (ensures proper ---/+++ headers)
+     */
+    public makeGitCompatible(diffText: string, fileName: string): string {
+        const lines = diffText.split('\n');
+        
+        // Check if already has proper headers
+        const hasProperHeaders = lines.some(line => 
+            line.startsWith('--- a/') && !line.includes('filename.ext')
+        );
+        
+        if (hasProperHeaders) {
+            return diffText;
+        }
+        
+        // Remove any existing incomplete headers
+        const contentLines = lines.filter(line => 
+            !line.startsWith('--- ') && !line.startsWith('+++ ')
+        );
+        
+        // Add Git-compatible headers
+        return `--- a/${fileName}\n+++ b/${fileName}\n${contentLines.join('\n')}`;
+    }
+    
+    /**
+     * Apply patch using Git's built-in apply
+     */
+    public async applyGitPatch(patchPath: string): Promise<{ success: boolean; output: string; error: string }> {
+        return new Promise((resolve) => {
+            const { exec } = require('child_process');
+            
+            // Use git apply with 3-way merge for better conflict resolution
+            exec(`git apply --3way "${patchPath}"`, (error: any, stdout: string, stderr: string) => {
+                if (error) {
+                    resolve({
+                        success: false,
+                        output: stdout,
+                        error: stderr || error.message
+                    });
+                } else {
+                    resolve({
+                        success: true,
+                        output: stdout,
+                        error: ''
+                    });
+                }
+            });
+        });
+    }
+    
+    /**
+     * Validate if patch can be applied with git
+     */
+    public async checkGitPatch(patchPath: string): Promise<{ canApply: boolean; errors: string[] }> {
+        return new Promise((resolve) => {
+            const { exec } = require('child_process');
+            
+            exec(`git apply --check "${patchPath}"`, (error: any) => {
+                if (error) {
+                    resolve({
+                        canApply: false,
+                        errors: [error.message]
+                    });
+                } else {
+                    resolve({
+                        canApply: true,
+                        errors: []
+                    });
+                }
+            });
+        });
+    }
+    
+    /**
+     * Set last AI suggestion
      */
     public setLastSuggestion(suggestion: AISuggestion): void {
         this.lastSuggestion = suggestion;
@@ -785,7 +1046,6 @@ export class DiffApplicationSystem {
         const newLines = result.newContent.split('\n');
         const changes: Array<{type: 'add' | 'delete' | 'modify'; line: number; content: string}> = [];
         
-        // Simplified change detection for preview
         for (const lineNum of result.appliedLines) {
             if (lineNum <= originalLines.length) {
                 changes.push({
@@ -809,6 +1069,28 @@ export class DiffApplicationSystem {
         };
     }
 }
+// Key Features:
+//     Simple Git-Compatible Patches:
+//        Saves as originalfile.featurename.diff in workspace root
+//         Includes proper --- a/... and +++ b/... headers
+//         Metadata comments with generation info
+//
+//     Built-in Git Integration:
+//         git apply "filename.diff" ready
+//         git apply --3way for better conflict handling
+//         git apply --check for validation
+//
+//     Your Workflow:
+//     vscode_extension_code_diff_openrouter_api.sh.feature1.diff
+//     vscode_extension_code_diff_openrouter_api.sh.feature2.diff
+//     git apply vscode_extension_code_diff_openrouter_api.sh.feature1.diff
+//
+//     Clean & Simple:
+//         No hidden .patches/ folder
+//         Patches visible in file explorer
+//         Easy to manage and version control
+//
+// Perfect for your LLM workflow! The patches are ready for git apply right after AI generates them. 🚀
 EOL
 
 
@@ -817,6 +1099,8 @@ EOL
 # ============================================================================
 
 cat << 'EOL' > src/extension.ts
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { openrouterPanel } from './webview';
 import { DiffApplicationSystem } from './diff_application';
@@ -851,6 +1135,57 @@ export function activate(context: vscode.ExtensionContext) {
         
         vscode.commands.registerCommand('openrouter.requestCodeReview', async () => {
             await aiPanel?.requestCodeReview();
+        }),
+
+        vscode.commands.registerCommand('openrouter.applyGitPatch', async (patchPath?: string) => {
+            if (!patchPath) {
+                // Show quick pick to select patch
+                const patches = diffSystem?.getSavedPatches() || [];
+                if (patches.length === 0) {
+                    vscode.window.showInformationMessage('No saved patches found');
+                    return;
+                }
+                
+                const items = patches.map(patch => ({
+                    label: `${patch.relativePath} - ${patch.explanation.substring(0, 50)}...`,
+                    description: new Date(patch.timestamp).toLocaleString(),
+                    detail: `git apply ${patch.relativePath}`,
+                    patch: patch  // This is the object with patch properties
+                }));
+                
+                const selected = await vscode.window.showQuickPick(items, {
+                    placeHolder: 'Select a patch to apply'
+                });
+                
+                if (!selected) return;
+                patchPath = selected.patch.patchFile;  // This should now work
+            }
+            
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                vscode.window.showErrorMessage('No workspace folder found');
+                return;
+            }
+            
+            const fullPath = path.join(workspaceFolders[0].uri.fsPath, patchPath);
+            
+            if (!fs.existsSync(fullPath)) {
+                vscode.window.showErrorMessage(`Patch file not found: ${fullPath}`);
+                return;
+            }
+            
+            const result = await diffSystem?.applyPatchFromFile(fullPath);
+            
+            if (result?.success) {
+                vscode.window.showInformationMessage('✅ Patch applied successfully!');
+                // Refresh the affected file
+                const editor = vscode.window.activeTextEditor;
+                if (editor) {
+                    vscode.commands.executeCommand('workbench.action.files.revert');
+                }
+            } else {
+                vscode.window.showErrorMessage(`❌ Failed to apply patch: ${result?.error || 'Unknown error'}`);
+            }
         }),
         
         vscode.commands.registerCommand('openrouter.applyAiSuggestion', async () => {
@@ -1141,6 +1476,7 @@ EOL
 cat << 'EOL' > src/webview.ts
 import * as vscode from 'vscode';
 import OpenAI from 'openai';
+import * as path from 'path';
 import { DiffApplicationSystem, type Comment, type AISuggestion } from './diff_application';
 
 interface ChatMessage {
@@ -1151,6 +1487,9 @@ interface ChatMessage {
     containsDiff?: boolean;
     diff?: string;
     explanation?: string;
+    // Add these:
+    patchFile?: string;
+    gitCommand?: string;
 }
 
 interface ModelInfo {
@@ -2140,7 +2479,7 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
                 console.log('✅ [saveConfiguration] Saved to global state fallback');
                 
                 // Still update local variables so extension works for this session
-                this.apiKey = config.apiKey;
+                this.apiKey = config.apiKey || '';
                 this.model = config.model;
                 this.initializeOpenAI();
                 
@@ -2283,6 +2622,27 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
                         });
                         break;
                     
+                    case 'applyGitPatch':
+                        const workspaceFolders = vscode.workspace.workspaceFolders;
+                        if (workspaceFolders && workspaceFolders.length > 0) {
+                            const fullPath = path.join(workspaceFolders[0].uri.fsPath, message.patchPath);
+                            const result = await this.diffSystem?.applyPatchFromFile(fullPath);
+                            
+                            webviewView.webview.postMessage({
+                                command: 'gitPatchApplied',
+                                success: result?.success || false,
+                                error: result?.error || ''
+                            });
+                        }
+                        break;
+
+                    case 'copyToClipboard':
+                        await vscode.env.clipboard.writeText(message.text);
+                        webviewView.webview.postMessage({
+                            command: 'clipboardCopied'
+                        });
+                        break;
+
                     case 'addComment':
                         await this.addCommentToActiveFile(message.comment, message.line);
                         break;
@@ -2386,7 +2746,7 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
             return;
         }
 
-        // Add user message to history - FIXED
+        // Add user message to history
         const userMessage: ChatMessage = {
             role: 'user',
             content: code ? `${content}\n\nCode context:\n${code}` : content,
@@ -2505,13 +2865,76 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
                 model: this.model,
                 containsDiff: containsDiff,
                 diff: containsDiff ? extracted.diff : undefined,
-                explanation: containsDiff ? extracted.explanation : undefined
+                explanation: containsDiff ? extracted.explanation : undefined,
+                patchFile: undefined,  // Initialize
+                gitCommand: undefined  // Initialize
             };
             this.chatHistory.push(assistantMessage);
             
             // Save chat history
             this.saveChatHistory();
             
+            // AUTO-SAVE .diff FILE if contains diff
+            if (containsDiff && extracted.diff) {
+                const editor = vscode.window.activeTextEditor;
+                if (editor) {
+                    const filePath = editor.document.uri.fsPath;
+                    const fileName = path.basename(filePath);
+                    
+                    // Fix the diff with proper file paths using existing methods
+                    const cleanedDiff = this.diffSystem.extractDiffFromAIResponse(fullResponse).diff || '';
+                    const gitCompatibleDiff = this.diffSystem.makeGitCompatible(cleanedDiff, fileName);
+                    const validation = this.diffSystem.validateDiff(gitCompatibleDiff);
+                    
+                    if (validation.isValid && gitCompatibleDiff) {
+                        // Save as git-compatible patch
+                        const saveResult = this.diffSystem.saveAsGitPatch(
+                            gitCompatibleDiff,
+                            filePath,
+                            extracted.explanation || 'AI suggested change',
+                            this.model,
+                            content,
+                            extracted.explanation || ''
+                        );
+                        
+                        if (saveResult.success) {
+                            // Show notification with git command
+                            const workspaceFolders = vscode.workspace.workspaceFolders;
+                            const workspaceRoot = workspaceFolders?.[0]?.uri.fsPath || '';
+                            const relativePatch = path.relative(workspaceRoot, saveResult.patchPath).replace(/\\/g, '/');
+                            
+                            vscode.window.showInformationMessage(
+                                `✅ Patch saved: ${relativePatch}`,
+                                'Copy Git Command',
+                                'Open Folder',
+                                'Apply Now'
+                            ).then(async (selection) => {
+                                if (selection === 'Copy Git Command') {
+                                    await vscode.env.clipboard.writeText(saveResult.gitCommand);
+                                    vscode.window.showInformationMessage('Git command copied to clipboard!');
+                                } else if (selection === 'Open Folder') {
+                                    const uri = vscode.Uri.file(path.dirname(saveResult.patchPath));
+                                    vscode.commands.executeCommand('revealFileInOS', uri);
+                                } else if (selection === 'Apply Now') {
+                                    const result = await this.diffSystem.applyGitPatch(saveResult.patchPath);
+                                    if (result.success) {
+                                        vscode.window.showInformationMessage('✅ Patch applied successfully!');
+                                        // Reload the file to show changes
+                                        vscode.commands.executeCommand('workbench.action.files.revert');
+                                    } else {
+                                        vscode.window.showErrorMessage(`❌ Failed to apply patch: ${result.error}`);
+                                    }
+                                }
+                            });
+                            
+                            // Update message with patch info
+                            assistantMessage.patchFile = saveResult.patchPath;
+                            assistantMessage.gitCommand = saveResult.gitCommand;
+                        }
+                    }
+                }
+            }
+
             // Store as last suggestion if it contains a diff
             if (containsDiff && extracted.diff) {
                 const editor = vscode.window.activeTextEditor;
@@ -3333,6 +3756,43 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
                 </button>
             </div>
         </div>
+        <div class="diff-block">
+            <div class="diff-header">
+                <strong>🤖 AI Code Suggestion</strong>
+                <div class="diff-explanation">{{explanation}}</div>
+                {{#if patchFile}}
+                <div class="patch-info" style="font-size: 0.8em; color: var(--success); margin-top: 4px;">
+                    ✅ Patch saved: {{patchFileName}}
+                </div>
+                {{/if}}
+            </div>
+            
+            <div class="diff-content">
+                {{diffContent}}
+            </div>
+            
+            <div class="diff-actions">
+                <button class="diff-action-btn" onclick="validateDiff('{{diff}}')">
+                    Validate
+                </button>
+                <button class="diff-action-btn" onclick="previewDiff('{{diff}}', '{{explanation}}')">
+                    Preview
+                </button>
+                <button class="diff-action-btn" onclick="applyDiff('{{diff}}', '{{explanation}}')">
+                    Apply in Editor
+                </button>
+                {{#if patchFile}}
+                <button class="diff-action-btn" onclick="copyGitCommand('{{gitCommand}}')" 
+                        style="background: var(--accent); color: white;">
+                    📋 Copy Git Command
+                </button>
+                <button class="diff-action-btn" onclick="applyGitPatch('{{patchFile}}')"
+                        style="background: var(--success); color: white;">
+                    🚀 Apply via Git
+                </button>
+                {{/if}}
+            </div>
+        </div>
     </div>
     
     <div id="diffPreviewModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
@@ -3461,6 +3921,21 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
             });
         }
         
+        function copyGitCommand(command) {
+            vscode.postMessage({
+                command: 'copyToClipboard',
+                text: command
+            });
+        }
+
+        function applyGitPatch(patchPath) {
+            if (confirm('Apply this patch using git apply?')) {
+                vscode.postMessage({
+                    command: 'applyGitPatch',
+                    patchPath: patchPath
+                });
+            }
+        }
 
         // FIXED: Using \\n for embedded JavaScript strings
         function showValidationResult(isValid, errors, warnings) {
@@ -3782,6 +4257,22 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
                         message.success ? 'success' : 'error'
                     );
                     break;
+                
+                case 'patchSaved':
+                    showPatchSavedNotification(message.patchPath, message.gitCommand);
+                    break;
+                    
+                case 'gitPatchApplied':
+                    if (message.success) {
+                        showMessage('✅ Patch applied via git!', 'success');
+                    } else {
+                                showMessage('❌ Git apply failed: ' + message.error, 'error');
+                    }
+                    break;
+                    
+                case 'clipboardCopied':
+                    showMessage('📋 Git command copied to clipboard!', 'success');
+                    break;
             }
         });
         
@@ -3854,6 +4345,40 @@ export class openrouterPanel implements vscode.WebviewViewProvider {
             }
         }
         
+        function showPatchSavedNotification(patchPath: string, gitCommand: string): void {
+            const notification = document.createElement('div');
+            notification.className = 'validation-result validation-valid';
+            notification.style.cssText = 'position: fixed; top: 20px; right: 20px; z-index: 1000; width: 400px;';
+            
+            const relativePath = patchPath.split('.patches/').pop() || patchPath;
+            
+            // FIXED: Use string concatenation instead of template literal
+            notification.innerHTML = 
+                '<h4>✅ Patch Saved</h4>' +
+                '<p>Saved to: <code>' + escapeHtml(relativePath) + '</code></p>' +
+                '<p>Apply from console:</p>' +
+                '<pre style="background: rgba(0,0,0,0.1); padding: 8px; border-radius: 4px; font-size: 0.9em;">' +
+                '    cd /path/to/project' +
+                '    ' + escapeHtml(gitCommand) + '</pre>' +
+                '<div style="display: flex; gap: 8px; margin-top: 12px;">' +
+                '    <button onclick="copyToClipboard(\'' + escapeHtml(gitCommand) + '\')" style="padding: 4px 8px; font-size: 0.9em;">' +
+                '        Copy Command' +
+                '    </button>' +
+                '    <button onclick="closeNotification(this)" style="padding: 4px 8px; font-size: 0.9em;">' +
+                '        Dismiss' +
+                '    </button>' +
+                '</div>';
+            
+            document.body.appendChild(notification);
+            
+            // Auto-remove after 10 seconds
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.remove();
+                }
+            }, 10000);
+        }
+
         // Message handler from extension
         window.addEventListener('message', (event) => {
             const message = event.data;

@@ -1,0 +1,21 @@
+--- a/example.py
++++ b/example.py
+@@ -1,8 +1,15 @@
+-def calculate_sum(numbers):
+-    total = 0
++from typing import List, Union
++
++def calculate_sum(numbers: List[Union[int, float]]) -> Union[int, float]:
++    """Calculate the sum of a list of numbers."""
++    if not numbers:
++        return 0
++    
++    total = 0.0
+     for num in numbers:
+         total += num
+     return total
+
+ def main():
++    """Main function to demonstrate calculate_sum."""
+     numbers = [1, 2, 3, 4, 5]
+     result = calculate_sum(numbers)

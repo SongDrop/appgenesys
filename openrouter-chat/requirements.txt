@@ -1,0 +1,10 @@
+# Python dependencies for OpenRouter Chat extension
+# Note: Most functionality uses Node.js/TypeScript
+# Python dependencies are optional for advanced features
+
+# OpenAI SDK for Python (if you need Python-side API access)
+openai>=1.0.0
+
+# For potential future Python-based features:
+python-dotenv>=1.0.0
+requests>=2.28.0
